@@ -1,0 +1,187 @@
+#!/bin/bash -e
+
+showUsage()
+{
+   cat <<EOF
+Usage: $0 [OPTION] file
+
+Attempts to automatically patch an ELF binary by inspecting its required
+libraries and binding them to the appropriate package providing them.
+
+Options:
+      --no-recurse    Do not recurse into sub directories
+      --variable      Name of the variable that contains the library paths to
+                      search in (defaults to: libs)
+  -h, --help          Show help page
+EOF
+}
+
+# Attempts to guess the system architecture from information provided by the ELF binary header
+
+guessArch()
+{
+    local class=$(readelf -h "$1" | grep "^  Class:" | tr -s ' ' | cut -d ' ' -f 3-)
+    local machine=$(readelf -h "$1" | grep "^  Machine:" | tr -s ' ' | cut -d ' ' -f 3-)
+
+    if [ "$class" = "ELF32" ] && [ "$machine" = "Intel 80386" ]
+    then
+        echo "i386"
+    elif [ "$class" = "ELF64" ] && [ "$machine" = "Advanced Micro Devices X86-64" ]
+    then
+        echo "x86_64"
+    else
+        echo "Cannot derive architecture from ELF binary for class: $class and machine: $machine" >&2
+        exit 1
+    fi
+}
+
+autoPatchBinary()
+{
+    local binary="$1"
+    local searchPathVariable="$2"
+
+    echo "Auto patching ELF binary: $binary" >&2
+
+    local binaryArch=$(guessArch "$binary")
+
+    # For each needed library, look for a package that provides and compose an RPATH string for all the paths
+
+    local archSpecificSearchPathVariable="${searchPathVariable}_${binaryArch}"
+
+    local neededLibraries=$(patchelf --print-needed "$binary")
+    local searchLibraryPaths="$(dirname "$binary"):${!archSpecificSearchPathVariable}:${!searchPathVariable}"
+
+    local rpath=
+
+    for lib in $neededLibraries
+    do
+        local foundLibPath=
+
+        if [ -e "$(dirname "$binary")/$lib" ]
+        then
+            foundLibPath="$(dirname "$binary")"
+        else
+            IFS=':'
+            for libPath in $searchLibraryPaths
+            do
+                if [ -e "$libPath/$lib" ]
+                then
+                    foundLibArch=$(guessArch "$libPath/$lib")
+
+                    if [ "$foundLibArch" = "$binaryArch" ]
+                    then
+                        foundLibPath="$libPath"
+                    else
+                        echo "WARNING: candidate library found but has architecture: $foundLibArch, while the binary has: $binaryArch" >&2
+                    fi
+                    break
+                fi
+            done
+            unset IFS
+        fi
+
+        if [ "$foundLibPath" = "" ]
+        then
+            echo "No package found that provides library: $lib" >&2
+            exit 1
+        else
+            rpath="$rpath${rpath:+:}$foundLibPath"
+        fi
+    done
+
+    # Patch the binary's RPATH to allow it to find the needed libraries
+
+    if [ "$rpath" != "" ]
+    then
+        echo "Setting RPATH to: $rpath" >&2
+        patchelf --set-rpath "$rpath" "$binary"
+    fi
+
+    # Check whether the binary requires a program interpreter, and if so, patch it
+
+    if readelf -l "$binary" | grep -q "Requesting program interpreter:"
+    then
+        IFS=':'
+        for libPath in $searchLibraryPaths
+        do
+            local interpreterLibrary=$(basename $(patchelf --print-interpreter "$binary"))
+            local interpreterSubstitute="$libPath/$interpreterLibrary"
+
+            if [ -e "$interpreterSubstitute" ]
+            then
+                echo "Changing program interpreter to: $interpreterSubstitute" >&2
+                patchelf --set-interpreter "$interpreterSubstitute" "$binary"
+                local interpreterPatched=1
+                break
+            fi
+        done
+        unset IFS
+
+        if [ "$interpreterPatched" != "1" ]
+        then
+            echo "Cannot find substitute interpreter: '$interpreterSubstitute'. Did you provide a compatible version of libc in the library search paths?" >&2
+            exit 1
+        fi
+    fi
+}
+
+# Parse valid command-line options
+
+PARAMS=`getopt -n $0 -o h -l no-recurse,variable:,help -- "$@"`
+
+if [ $? != 0 ]
+then
+    showUsage
+    exit 1
+fi
+
+# Evaluate valid options
+
+searchPathVariable="libs"
+
+eval set -- "$PARAMS"
+
+while [ "$1" != "--" ]
+do
+    case "$1" in
+        --no-recurse)
+	    noRecurse=1
+            ;;
+        --variable)
+	    searchPathVariable="$1"
+            ;;		
+        -h|--help)
+	    showUsage
+	    ;;
+    esac
+
+    shift
+done
+
+shift
+
+pathParam="$1"
+
+# Execute operations
+
+if [ -f "$pathParam" ] # If parameter is file, then patch the individual binary
+then
+    autoPatchBinary "$pathParam" "$searchPathVariable"
+elif [ -d "$pathParam" ] # If parameter is a directory, then recursively look for ELF binaries and patch them
+then
+    echo "Patching all ELF binaries in directory: $1" >&2
+
+    if [ "$noRecurse" = "1" ]
+    then
+        findParam="-maxdepth 1"
+    fi
+
+    find "$pathParam" $findParam -type f | while read binary
+    do
+        if file $binary | grep -q "^$binary: ELF"
+        then
+            autoPatchBinary "$binary" "$searchPathVariable"
+        fi
+    done
+fi
+
