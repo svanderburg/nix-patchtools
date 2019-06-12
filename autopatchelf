@@ -29,6 +29,9 @@ guessArch()
     elif [ "$class" = "ELF64" ] && [ "$machine" = "Advanced Micro Devices X86-64" ]
     then
         echo "x86_64"
+    elif [ "$class" = "ELF64" ] && [ "$machine" = "AArch64" ]
+    then
+        echo "aarch64"
     else
         echo "Cannot derive architecture from ELF binary for class: $class and machine: $machine" >&2
         exit 1
