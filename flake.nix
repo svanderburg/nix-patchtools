@@ -6,21 +6,23 @@
   };
 
   outputs = { self, nixpkgs, flake-utils, ... }:
-    flake-utils.lib.eachDefaultSystem (system:
-      let
-        overlay = import ./nix/overlay.nix;
-        pkgs = import nixpkgs {
-          inherit system;
-          overlays = [ overlay ];
-        };
-      in
-      {
-        inherit overlay;
-
-        defaultPackage = pkgs.autopatchelf;
-        defaultApp = {
-          type = "app";
-          program = "${pkgs.autopatchelf}/bin/autopatchelf";
-        };
-      });
+    let
+      overlay = import ./nix/overlay.nix;
+    in
+    flake-utils.lib.eachDefaultSystem
+      (system:
+        let
+          pkgs = import nixpkgs {
+            inherit system;
+            overlays = [ overlay ];
+          };
+        in
+        {
+          defaultPackage = pkgs.autopatchelf;
+          defaultApp = {
+            type = "app";
+            program = "${pkgs.autopatchelf}/bin/autopatchelf";
+          };
+        })
+    // { inherit overlay; };
 }
